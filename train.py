@@ -1,15 +1,11 @@
 import argparse
-import os.path as osp
-
+from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-from mini_imagenet import MiniImageNet
+from mini_imagenet import PNDataset, my_collate
 from samplers import CategoriesSampler
-from convnet import Convnet
-from utils import pprint, set_gpu, ensure_path, Averager, Timer, count_acc, euclidean_metric
-
+from convnet import PNModel
+from utils import pprint, set_gpu, ensure_path, count_acc, euclidean_metric, count_acc, setup_seed
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -25,119 +21,85 @@ if __name__ == '__main__':
     pprint(vars(args))
 
     set_gpu(args.gpu)
-    ensure_path(args.save_path)
+    setup_seed(2023)
+    #ensure_path(args.save_path)
 
-    trainset = MiniImageNet('train')
-    train_sampler = CategoriesSampler(trainset.label, 100,
-                                      args.train_way, args.shot + args.query)
-    train_loader = DataLoader(dataset=trainset, batch_sampler=train_sampler,
-                              num_workers=8, pin_memory=True)
+    trainset = PNDataset('traffic_train')
+    train_sampler = CategoriesSampler(trainset.label, 10, args.shot + 2, args.train_way)
+    train_loader = DataLoader(dataset=trainset,
+                              batch_sampler=train_sampler,
+                              collate_fn=my_collate)
 
-    valset = MiniImageNet('val')
-    val_sampler = CategoriesSampler(valset.label, 400,
-                                    args.test_way, args.shot + args.query)
-    val_loader = DataLoader(dataset=valset, batch_sampler=val_sampler,
-                            num_workers=8, pin_memory=True)
+    validset = PNDataset('traffic_valid')
+    valid_loader = DataLoader(dataset=validset,
+                              batch_size=10,
+                              collate_fn=my_collate)
 
-    model = Convnet().cuda()
-    
+    model = PNModel().cuda()
+
+    criterion = torch.nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+                                                   step_size=20,
+                                                   gamma=0.5)
 
-    def save_model(name):
-        torch.save(model.state_dict(), osp.join(args.save_path, name + '.pth'))
-    
-    trlog = {}
-    trlog['args'] = vars(args)
-    trlog['train_loss'] = []
-    trlog['val_loss'] = []
-    trlog['train_acc'] = []
-    trlog['val_acc'] = []
-    trlog['max_acc'] = 0.0
-
-    timer = Timer()
-
-    for epoch in range(1, args.max_epoch + 1):
+    for epoch in range(args.max_epoch):
         lr_scheduler.step()
-
         model.train()
+        loss_all = 0
+        tp_all = fp_all = fn_all = tn_all = 0
+        for i, batch in enumerate(tqdm(train_loader)):
+            sen, label = batch
+            sen, label = sen.cuda(), label.cuda()
+            p = args.shot * 5
+            sen_support, sen_query = sen[:p], sen[p:]
+            label_support, label_query = label[:p], label[p:]
 
-        tl = Averager()
-        ta = Averager()
+            support = model(sen_support)
+            query = model(sen_query)
 
-        for i, batch in enumerate(train_loader, 1):
-            data, _ = [_.cuda() for _ in batch]
-            p = args.shot * args.train_way
-            data_shot, data_query = data[:p], data[p:]
-
-            proto = model(data_shot)
-            proto = proto.reshape(args.shot, args.train_way, -1).mean(dim=0)
-
-            label = torch.arange(args.train_way).repeat(args.query)
-            label = label.type(torch.cuda.LongTensor)
-
-            logits = euclidean_metric(model(data_query), proto)
-            loss = F.cross_entropy(logits, label)
-            acc = count_acc(logits, label)
-            print('epoch {}, train {}/{}, loss={:.4f} acc={:.4f}'
-                  .format(epoch, i, len(train_loader), loss.item(), acc))
-
-            tl.add(loss.item())
-            ta.add(acc)
+            logits = euclidean_metric(support, query, args.shot,
+                                      args.train_way, label_support)
+            loss = criterion(torch.abs(logits.float() - 0.001),
+                             label_query.float())
+            tp, fp, fn, tn = count_acc(logits.float(), label_query.float())
+            tp_all += tp
+            fp_all += fp
+            fn_all += fn
+            tn_all += tn
+            loss_all += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            proto = None; logits = None; loss = None
-
-        tl = tl.item()
-        ta = ta.item()
-
+        precision = tp_all / (tp_all + fp_all + 0.001)
+        recall = tp_all / (tp_all + fn_all + 0.001)
+        print(
+            'epoch {}, loss={:.4f}, precision={:.4f}, recall={:.4f}, f1={:.4f}'
+            .format(epoch, loss_all, precision, recall,
+                    2 * (precision * recall) / (precision + recall + 0.001)))
+        
         model.eval()
-
-        vl = Averager()
-        va = Averager()
-
-        for i, batch in enumerate(val_loader, 1):
-            data, _ = [_.cuda() for _ in batch]
-            p = args.shot * args.test_way
-            data_shot, data_query = data[:p], data[p:]
-
-            proto = model(data_shot)
-            proto = proto.reshape(args.shot, args.test_way, -1).mean(dim=0)
-
-            label = torch.arange(args.test_way).repeat(args.query)
-            label = label.type(torch.cuda.LongTensor)
-
-            logits = euclidean_metric(model(data_query), proto)
-            loss = F.cross_entropy(logits, label)
-            acc = count_acc(logits, label)
-
-            vl.add(loss.item())
-            va.add(acc)
-            
-            proto = None; logits = None; loss = None
-
-        vl = vl.item()
-        va = va.item()
-        print('epoch {}, val, loss={:.4f} acc={:.4f}'.format(epoch, vl, va))
-
-        if va > trlog['max_acc']:
-            trlog['max_acc'] = va
-            save_model('max-acc')
-
-        trlog['train_loss'].append(tl)
-        trlog['train_acc'].append(ta)
-        trlog['val_loss'].append(vl)
-        trlog['val_acc'].append(va)
-
-        torch.save(trlog, osp.join(args.save_path, 'trlog'))
-
-        save_model('epoch-last')
-
-        if epoch % args.save_epoch == 0:
-            save_model('epoch-{}'.format(epoch))
-
-        print('ETA:{}/{}'.format(timer.measure(), timer.measure(epoch / args.max_epoch)))
+        loss_all = 0
+        tp_all = fp_all = fn_all = tn_all = 0
+        for i, batch in enumerate(valid_loader):
+            sen, label = batch
+            sen, label = sen.cuda(), label.cuda()
+            query = model(sen)
+            logits = euclidean_metric(support, query, args.shot,
+                                      args.train_way, label_support)
+            loss = criterion(torch.abs(logits.float() - 0.001),
+                             label.float())
+            tp, fp, fn, tn = count_acc(logits.float(), label.float())
+            tp_all += tp
+            fp_all += fp
+            fn_all += fn
+            tn_all += tn
+            loss_all += loss.item()
+        precision = tp_all / (tp_all + fp_all + 0.001)
+        recall = tp_all / (tp_all + fn_all + 0.001)
+        print(
+            'epoch {}, loss={:.4f}, precision={:.4f}, recall={:.4f}, f1={:.4f}'
+            .format(epoch, loss_all, precision, recall,
+                    2 * (precision * recall) / (precision + recall + 0.001)))
 

@@ -1,32 +1,29 @@
 import torch
-import numpy as np
 
 
 class CategoriesSampler():
-
-    def __init__(self, label, n_batch, n_cls, n_per):
+    def __init__(self, label, n_batch, n_shot, train_way):
         self.n_batch = n_batch
-        self.n_cls = n_cls
-        self.n_per = n_per
-
-        label = np.array(label)
-        self.m_ind = []
-        for i in range(max(label) + 1):
-            ind = np.argwhere(label == i).reshape(-1)
-            ind = torch.from_numpy(ind)
-            self.m_ind.append(ind)
+        self.n_shot = n_shot
+        self.label = label
+        self.label2id = {}
+        for i in range(train_way):
+            self.label2id[i] = []
+        for idx, all_label in enumerate(label):
+            for i, meet in enumerate(all_label):
+                if meet == 1:
+                    self.label2id[i].append(idx)
 
     def __len__(self):
         return self.n_batch
-    
+
     def __iter__(self):
-        for i_batch in range(self.n_batch):
+        for i in range(self.n_batch):
             batch = []
-            classes = torch.randperm(len(self.m_ind))[:self.n_cls]
-            for c in classes:
-                l = self.m_ind[c]
-                pos = torch.randperm(len(l))[:self.n_per]
-                batch.append(l[pos])
+            c_idxs = torch.randperm(len(self.label2id))[:5]
+            for idx in c_idxs:
+                # random.shuffle(self.label2id[l])
+                pos = torch.randperm(len(self.label2id[idx.item()]))[:self.n_shot]
+                batch.append(torch.LongTensor(self.label2id[idx.item()])[pos])
             batch = torch.stack(batch).t().reshape(-1)
             yield batch
-

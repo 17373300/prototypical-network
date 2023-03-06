@@ -1,8 +1,9 @@
 import os
 import shutil
 import time
+import random
+import numpy as np
 import pprint
-
 import torch
 
 
@@ -21,7 +22,6 @@ def ensure_path(path):
 
 
 class Averager():
-
     def __init__(self):
         self.n = 0
         self.v = 0
@@ -43,17 +43,69 @@ def dot_metric(a, b):
     return torch.mm(a, b.t())
 
 
-def euclidean_metric(a, b):
-    n = a.shape[0]
-    m = b.shape[0]
-    a = a.unsqueeze(1).expand(n, m, -1)
-    b = b.unsqueeze(0).expand(n, m, -1)
-    logits = -((a - b)**2).sum(dim=2)
-    return logits
+'''def euclidean_metric(support, query, shot, train_way):
+    proto = support.reshape(shot, train_way, -1).mean(dim=0)
+    query_norm = torch.norm(query, p=2, dim=1, keepdim=True)
+    proto_norm = torch.norm(proto, p=2, dim=1, keepdim=True)
+    norm = torch.matmul(query_norm, proto_norm.T)
+    sim = torch.matmul(query, proto.T)
+    sim = sim / norm
+
+    return sim'''
+
+
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def euclidean_metric(support, query, shot, train_way, label_support):
+    # (s,w) -> (w,s) -> (w,s,1) -> (w,s,Hd)
+    label_proto = label_support.T.unsqueeze(2).repeat((1, 1, support.size(1)))
+    # (s,hd) -> (1,s,hd) -> (w,s,hd)
+    support_proto = support.unsqueeze(0).repeat((train_way, 1, 1))
+    # (w,s,Hd) * (w,s,hd) -> (w,s,hd)
+    proto = label_proto * support_proto
+
+    # (w,s,hd) -> (w,hd)
+    proto = torch.sum(proto, 1)
+    # (s,w) -> (w) -> (w,hd)
+    label = torch.sum(label_support, 0)
+    label = label.unsqueeze(1).repeat((1, support.size(1)))
+    label = label+0.01
+    proto = proto / label
+
+    query_norm = torch.norm(query, p=2, dim=1, keepdim=True)
+    proto_norm = torch.norm(proto, p=2, dim=1, keepdim=True)
+    norm = torch.matmul(query_norm, proto_norm.T)
+    sim = torch.matmul(query, proto.T)
+    norm = norm+0.01
+    sim = sim / norm
+
+    return sim
+
+
+def count_acc(predict, label):
+    tp = fp = fn = tn = 0
+    for i in range(len(predict)):
+        for j in range(len(predict[0])):
+            if predict[i][j] > 0.7:
+                if label[i][j] > 0.5:
+                    tp += 1
+                else:
+                    fp += 1
+            else:
+                if label[i][j] > 0.5:
+                    fn += 1
+                else:
+                    tn += 1
+    return tp, fp, fn, tn
 
 
 class Timer():
-
     def __init__(self):
         self.o = time.time()
 
@@ -73,4 +125,3 @@ def pprint(x):
 
 def l2_loss(pred, label):
     return ((pred - label)**2).sum() / len(pred) / 2
-

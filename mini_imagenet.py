@@ -1,50 +1,39 @@
 import os.path as osp
-from PIL import Image
-
 from torch.utils.data import Dataset
-from torchvision import transforms
-
+import json
+from transformers import BertTokenizer
+import torch
 
 ROOT_PATH = './materials/'
 
 
-class MiniImageNet(Dataset):
+def my_collate(batch):
+    sen = [item[0] for item in batch]
+    label = [item[1] for item in batch]
 
+    sen = torch.nn.utils.rnn.pad_sequence(sen,
+                                          batch_first=True,
+                                          padding_value=0)
+
+    return sen, torch.LongTensor(label)
+
+
+class PNDataset(Dataset):
     def __init__(self, setname):
-        csv_path = osp.join(ROOT_PATH, setname + '.csv')
-        lines = [x.strip() for x in open(csv_path, 'r').readlines()][1:]
-
-        data = []
-        label = []
-        lb = -1
-
-        self.wnids = []
-
-        for l in lines:
-            name, wnid = l.split(',')
-            path = osp.join(ROOT_PATH, 'images', name)
-            if wnid not in self.wnids:
-                self.wnids.append(wnid)
-                lb += 1
-            data.append(path)
-            label.append(lb)
-
-        self.data = data
-        self.label = label
-
-        self.transform = transforms.Compose([
-            transforms.Resize(84),
-            transforms.CenterCrop(84),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
+        path = osp.join(ROOT_PATH, setname + '.json')
+        with open(path, "r", encoding='utf-8') as f:
+            data = json.load(f)
+        self.sen = []
+        self.label = []
+        for i in data:
+            self.sen.append(i['text'])
+            self.label.append(i['np_label'][:8])
+        self.tokenizer = BertTokenizer.from_pretrained("./xs/",
+                                                       do_lower_case=False)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.sen)
 
     def __getitem__(self, i):
-        path, label = self.data[i], self.label[i]
-        image = self.transform(Image.open(path).convert('RGB'))
-        return image, label
-
+        token_sen = self.tokenizer.encode(self.sen[i][:500])
+        return torch.LongTensor(token_sen), self.label[i]
